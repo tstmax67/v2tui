@@ -941,10 +941,17 @@ fn truncate_chars(s: &str, max: usize) -> String {
     t
 }
 
-/// SHA-256 of the subscription file's content, as hex. Identifies the file in cache.json
-/// whatever it is called or wherever it lives.
-fn content_hash(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+/// SHA-256 (hex) of the nodes a subscription file contains. Identifies the file in cache.json
+/// whatever it is called, wherever it lives, or how it is encoded: a base64 subscription and
+/// its decoded copy (or one with different line endings, comments or blank lines) parse to
+/// the same nodes and so share one cache entry.
+fn content_hash(nodes: &[Node]) -> String {
+    let mut h = Sha256::new();
+    for n in nodes {
+        h.update(n.key.as_bytes());
+        h.update(b"\n");
+    }
+    format!("{:x}", h.finalize())
 }
 
 fn ping_to_i64(p: Ping) -> Option<i64> {
@@ -2845,7 +2852,7 @@ fn main() -> io::Result<()> {
         eprintln!("no supported links (vmess/vless/trojan/ss) found in {path}");
         std::process::exit(1);
     }
-    let file_hash = content_hash(&text);
+    let file_hash = content_hash(&nodes);
     let file_path = fs::canonicalize(&path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path.clone());
