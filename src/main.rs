@@ -34,12 +34,19 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const PING_WORKERS: usize = 32;
 /// Exit-IP checks start one xray process each, so far fewer run at once than TCP pings.
 const EXIT_WORKERS: usize = 8;
+/// Per-subscription results (pings, exit IPs, selection) for every file ever opened.
+const CACHE_FILE: &str = "cache.json";
+/// Keep at most this many subscription files in the cache (the most recently used ones) ...
+const CACHE_MAX_FILES: usize = 10;
+/// ... and forget files that were not opened for this long.
+const CACHE_MAX_AGE_SECS: u64 = 90 * 24 * 3600;
 const PING_TIMEOUT_MS: u64 = 2500;
 /// The layout is designed for at least this many columns and rows.
 const MIN_W: u16 = 130;
@@ -101,6 +108,9 @@ struct Node {
     outbound: Value,
     ping: Ping,
     exit: ExitState,
+    /// A node that is not in the opened file: the still-running connection of an earlier
+    /// file, restored from state.json. It is dropped from the list once disconnected.
+    external: bool,
 }
 
 /// "UK" is how some subscriptions write "GB".
@@ -436,6 +446,7 @@ fn finish(
         outbound,
         ping: Ping::Unknown,
         exit: ExitState::Unknown,
+        external: false,
     }
 }
 
@@ -930,7 +941,127 @@ fn truncate_chars(s: &str, max: usize) -> String {
     t
 }
 
-/// ~/.cache/v2tui (or $XDG_CACHE_HOME/v2tui): state, core config and core log live here.
+/// SHA-256 of the subscription file's content, as hex. Identifies the file in cache.json
+/// whatever it is called or wherever it lives.
+fn content_hash(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn ping_to_i64(p: Ping) -> Option<i64> {
+    match p {
+        Ping::Ms(m) => Some(m as i64),
+        Ping::Fail => Some(-1),
+        Ping::Unknown | Ping::Testing => None,
+    }
+}
+
+fn ping_from_i64(p: i64) -> Ping {
+    if p < 0 {
+        Ping::Fail
+    } else {
+        Ping::Ms(p as u128)
+    }
+}
+
+fn exit_to_json(e: &ExitState) -> Option<Value> {
+    match e {
+        ExitState::Ok { ip, code, name } => Some(json!({ "ip": ip, "code": code, "name": name })),
+        _ => None,
+    }
+}
+
+fn exit_from_json(v: &Value) -> Option<ExitState> {
+    let ip = jstr(v, "ip");
+    let code = jstr(v, "code");
+    let name = jstr(v, "name");
+    if ip.is_empty() || code.is_empty() {
+        None
+    } else {
+        Some(ExitState::Ok { ip, code, name })
+    }
+}
+
+/// Everything about a node that is needed to show it and manage its connection.
+fn node_to_json(n: &Node) -> Value {
+    json!({
+        "key": n.key, "proto": n.proto, "name": n.name, "code": n.code, "country": n.country,
+        "host": n.host, "port": n.port, "net": n.net, "sec": n.sec, "sni": n.sni,
+        "outbound": n.outbound,
+        "ping": ping_to_i64(n.ping),
+        "exit": exit_to_json(&n.exit),
+    })
+}
+
+/// Rebuild a node saved by node_to_json (always flagged `external`).
+fn node_from_json(v: &Value) -> Option<Node> {
+    let key = jstr(v, "key");
+    let host = jstr(v, "host");
+    let outbound = v.get("outbound")?.clone();
+    if key.is_empty() || host.is_empty() || !outbound.is_object() {
+        return None;
+    }
+    let port = v.get("port")?.as_u64()? as u16;
+    Some(Node {
+        key,
+        proto: jstr(v, "proto"),
+        name: jstr(v, "name"),
+        code: jstr(v, "code"),
+        country: jstr(v, "country"),
+        host,
+        port,
+        net: jstr(v, "net"),
+        sec: jstr(v, "sec"),
+        sni: jstr(v, "sni"),
+        outbound,
+        ping: v
+            .get("ping")
+            .and_then(|x| x.as_i64())
+            .map(ping_from_i64)
+            .unwrap_or(Ping::Unknown),
+        exit: v.get("exit").and_then(exit_from_json).unwrap_or(ExitState::Unknown),
+        external: true,
+    })
+}
+
+/// The "files" map of cache.json: content hash -> what v2tui learned about that file.
+fn read_cache(dir: &Path) -> serde_json::Map<String, Value> {
+    fs::read_to_string(dir.join(CACHE_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("files").and_then(|f| f.as_object().cloned()))
+        .unwrap_or_default()
+}
+
+/// Version 1 of state.json kept one file's pings/exits/selection inside it. Turn that into a
+/// cache entry, so the results of the last session are not lost when upgrading.
+fn legacy_entry(v: &Value) -> Option<Value> {
+    let pings = v.get("pings")?.as_object()?;
+    let mut nodes = serde_json::Map::new();
+    for (k, p) in pings {
+        nodes.entry(k.clone()).or_insert_with(|| json!({}))["ping"] = p.clone();
+    }
+    if let Some(ex) = v.get("exits").and_then(|x| x.as_object()) {
+        for (k, e) in ex {
+            nodes.entry(k.clone()).or_insert_with(|| json!({}))["exit"] = e.clone();
+        }
+    }
+    Some(json!({
+        "ping_all_at": v.get("ping_all_at"),
+        "selected": v.get("selected"),
+        "nodes": nodes,
+    }))
+}
+
+/// Where the cursor was in a file the last time it was open.
+#[derive(Default)]
+struct SavedView {
+    selected: Option<String>,
+    row: Option<usize>,
+    offset: usize,
+}
+
+/// ~/.cache/v2tui (or $XDG_CACHE_HOME/v2tui): settings, per-file cache, core config and core
+/// log live here.
 fn cache_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
@@ -1079,13 +1210,19 @@ struct App {
     state_dirty: bool,
     /// Temporary xray processes used for exit-IP checks.
     probes: Probes,
+    /// SHA-256 of the opened file's content, and where it was opened from.
+    file_hash: String,
+    file_path: String,
+    /// cache.json: what is known about every subscription file seen so far, by hash.
+    cache: serde_json::Map<String, Value>,
 }
 
 impl App {
-    fn new(nodes: Vec<Node>) -> Self {
+    fn new(nodes: Vec<Node>, file_hash: String, file_path: String) -> Self {
         let (tx, rx) = mpsc::channel();
         let core = which("xray");
         let dir = cache_dir();
+        let cache = read_cache(&dir);
         let status = String::new(); // the "Core" line in the status box covers a missing core
         let mut app = App {
             nodes,
@@ -1116,21 +1253,32 @@ impl App {
             last_save: Instant::now(),
             state_dirty: false,
             probes: Probes::default(),
+            file_hash,
+            file_path,
+            cache,
         };
-        let saved_selected = app.load_state();
+        let legacy = app.load_global();
+        let saved = app.load_file_cache(legacy);
         app.rebuild();
 
-        // Jump to the running connection's row, else to where you were last time.
-        let target = app
-            .active
-            .as_ref()
-            .map(|a| a.node)
-            .or_else(|| saved_selected.and_then(|k| app.nodes.iter().position(|n| n.key == k)));
-        if let Some(t) = target {
-            if let Some(pos) = app.view.iter().position(|&i| i == t) {
-                app.state.select(Some(pos));
+        // Jump to the running connection's row, else to where you were last time in this file.
+        let target = app.active.as_ref().map(|a| a.node).or_else(|| {
+            saved
+                .selected
+                .as_ref()
+                .and_then(|k| app.nodes.iter().position(|n| &n.key == k))
+        });
+        match target.and_then(|t| app.view.iter().position(|&i| i == t)) {
+            Some(pos) => app.state.select(Some(pos)),
+            None => {
+                if let Some(row) = saved.row {
+                    if !app.view.is_empty() {
+                        app.state.select(Some(row.min(app.view.len() - 1)));
+                    }
+                }
             }
         }
+        *app.state.offset_mut() = saved.offset;
         if app.active.is_some() {
             // No exit-IP request on startup: show what was found last time, if anything.
             // (Press e to check it again.)
@@ -1145,7 +1293,11 @@ impl App {
         app
     }
 
-    fn load_state(&mut self) -> Option<String> {
+    /// state.json: what belongs to you rather than to one subscription file. It stays the
+    /// same when you open another file: sort order, mode, toggles and the running connection
+    /// (with the node's full data, so it can still be managed if it is not in this file).
+    /// Returns the old per-file data when this is a version-1 state.json.
+    fn load_global(&mut self) -> Option<Value> {
         let text = fs::read_to_string(self.dir.join("state.json")).ok()?;
         let v: Value = serde_json::from_str(&text).ok()?;
         if let Some(s) = v.get("sort").and_then(|x| x.as_str()) {
@@ -1153,88 +1305,151 @@ impl App {
         }
         self.hide_dead = v.get("hide_dead").and_then(|x| x.as_bool()).unwrap_or(false);
         self.insecure = v.get("insecure").and_then(|x| x.as_bool()).unwrap_or(false);
-        if let Some(m) = v.get("pings").and_then(|x| x.as_object()) {
-            for n in self.nodes.iter_mut() {
-                if let Some(p) = m.get(&n.key).and_then(|x| x.as_i64()) {
-                    n.ping = if p < 0 { Ping::Fail } else { Ping::Ms(p as u128) };
-                }
-            }
-        }
-        if let Some(m) = v.get("exits").and_then(|x| x.as_object()) {
-            for n in self.nodes.iter_mut() {
-                if let Some(e) = m.get(&n.key) {
-                    let ip = jstr(e, "ip");
-                    let code = jstr(e, "code");
-                    let name = jstr(e, "name");
-                    if !ip.is_empty() && !code.is_empty() {
-                        n.exit = ExitState::Ok { ip, code, name };
-                    }
-                }
-            }
-        }
-        self.ping_all_at = v.get("ping_all_at").and_then(|x| x.as_u64());
         self.vpn_mode = v.get("vpn_mode").and_then(|x| x.as_bool()).unwrap_or(false);
         self.live_ping = v.get("live_ping").and_then(|x| x.as_bool()).unwrap_or(false);
         if let Some(a) = v.get("active").filter(|a| a.is_object()) {
             let pid = a.get("pid").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            let key = a.get("key").and_then(|x| x.as_str()).unwrap_or("");
             let vpn = a.get("vpn").and_then(|x| x.as_bool()).unwrap_or(false);
+            let saved_node = a.get("node").and_then(node_from_json);
+            let key = a
+                .get("key")
+                .and_then(|x| x.as_str())
+                .map(String::from)
+                .or_else(|| saved_node.as_ref().map(|n| n.key.clone()))
+                .unwrap_or_default();
             if pid != 0 && core_alive(pid) {
-                match self.nodes.iter().position(|n| n.key == key) {
-                    Some(i) => self.active = Some(Active { node: i, pid, child: None, vpn }),
-                    None => {
-                        let how = if vpn { "sudo kill" } else { "kill" };
-                        self.status = format!(
-                            "a core (pid {pid}) is running but its node is not in this file; stop it with: {how} {pid}"
-                        )
+                if let Some(i) = self.nodes.iter().position(|n| n.key == key) {
+                    self.active = Some(Active { node: i, pid, child: None, vpn });
+                } else if let Some(n) = saved_node {
+                    // Not in this file (it was changed or replaced): keep the node as saved.
+                    self.nodes.push(n);
+                    let node = self.nodes.len() - 1;
+                    self.active = Some(Active { node, pid, child: None, vpn });
+                } else {
+                    let how = if vpn { "sudo kill" } else { "kill" };
+                    self.status = format!(
+                        "a core (pid {pid}) is running but its node is not in this file; stop it with: {how} {pid}"
+                    )
+                }
+            }
+        }
+        if v.get("version").and_then(|x| x.as_u64()) == Some(1) {
+            legacy_entry(&v)
+        } else {
+            None
+        }
+    }
+
+    /// This file's entry in cache.json (found by content hash): pings, exit IPs, when "ping
+    /// all" last ran, and where the cursor was.
+    fn load_file_cache(&mut self, legacy: Option<Value>) -> SavedView {
+        let entry = self.cache.get(&self.file_hash).cloned().or(legacy);
+        let Some(e) = entry else { return SavedView::default() };
+        if let Some(m) = e.get("nodes").and_then(|x| x.as_object()) {
+            for n in self.nodes.iter_mut().filter(|n| !n.external) {
+                if let Some(d) = m.get(&n.key) {
+                    if let Some(p) = d.get("ping").and_then(|x| x.as_i64()) {
+                        n.ping = ping_from_i64(p);
+                    }
+                    if let Some(x) = d.get("exit").and_then(exit_from_json) {
+                        n.exit = x;
                     }
                 }
             }
         }
-        v.get("selected").and_then(|x| x.as_str()).map(String::from)
+        self.ping_all_at = e.get("ping_all_at").and_then(|x| x.as_u64());
+        SavedView {
+            selected: e.get("selected").and_then(|x| x.as_str()).map(String::from),
+            row: e.get("row").and_then(|x| x.as_u64()).map(|x| x as usize),
+            offset: e.get("offset").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        }
     }
 
     fn save_state(&mut self) {
-        let mut pings = serde_json::Map::new();
-        let mut exits = serde_json::Map::new();
-        for n in &self.nodes {
-            if let ExitState::Ok { ip, code, name } = &n.exit {
-                exits.insert(n.key.clone(), json!({ "ip": ip, "code": code, "name": name }));
-            }
-            match n.ping {
-                Ping::Ms(m) => {
-                    pings.insert(n.key.clone(), json!(m as u64));
-                }
-                Ping::Fail => {
-                    pings.insert(n.key.clone(), json!(-1));
-                }
-                Ping::Unknown | Ping::Testing => {}
-            }
-        }
-        let selected = self.selected_node().map(|i| self.nodes[i].key.clone());
-        let active = self
-            .active
-            .as_ref()
-            .map(|a| json!({ "pid": a.pid, "key": self.nodes[a.node].key, "vpn": a.vpn }));
+        self.save_global();
+        self.save_cache();
+        self.last_save = Instant::now();
+        self.state_dirty = false;
+    }
+
+    fn save_global(&self) {
+        let active = self.active.as_ref().map(|a| {
+            let n = &self.nodes[a.node];
+            json!({ "pid": a.pid, "vpn": a.vpn, "key": n.key, "node": node_to_json(n) })
+        });
         let state = json!({
-            "version": 1,
+            "version": 2,
             "sort": self.sort.id(),
             "hide_dead": self.hide_dead,
             "insecure": self.insecure,
-            "selected": selected,
-            "active": active,
-            "pings": pings,
-            "exits": exits,
-            "ping_all_at": self.ping_all_at,
             "vpn_mode": self.vpn_mode,
             "live_ping": self.live_ping,
+            "active": active,
         });
         let _ = write_private(
             &self.dir.join("state.json"),
             &serde_json::to_string(&state).unwrap_or_default(),
         );
-        self.last_save = Instant::now();
-        self.state_dirty = false;
+    }
+
+    /// Update this file's entry in cache.json (other files' entries are kept as they are),
+    /// and forget files that are old or beyond the CACHE_MAX_FILES most recent ones.
+    fn save_cache(&mut self) {
+        let mut nodes = serde_json::Map::new();
+        for n in self.nodes.iter().filter(|n| !n.external) {
+            let mut d = serde_json::Map::new();
+            if let Some(p) = ping_to_i64(n.ping) {
+                d.insert("ping".to_string(), json!(p));
+            }
+            if let Some(x) = exit_to_json(&n.exit) {
+                d.insert("exit".to_string(), x);
+            }
+            if !d.is_empty() {
+                nodes.insert(n.key.clone(), Value::Object(d));
+            }
+        }
+        let selected = self
+            .selected_node()
+            .filter(|&i| !self.nodes[i].external)
+            .map(|i| self.nodes[i].key.clone());
+        let now = now_unix();
+        let entry = json!({
+            "path": self.file_path,
+            "last_used": now,
+            "node_count": self.nodes.iter().filter(|n| !n.external).count(),
+            "ping_all_at": self.ping_all_at,
+            "selected": selected,
+            "row": self.state.selected(),
+            "offset": self.state.offset(),
+            "nodes": nodes,
+        });
+        self.cache.insert(self.file_hash.clone(), entry);
+
+        let used = |e: &Value| e.get("last_used").and_then(|x| x.as_u64()).unwrap_or(0);
+        self.cache.retain(|_, e| now.saturating_sub(used(&*e)) <= CACHE_MAX_AGE_SECS);
+        if self.cache.len() > CACHE_MAX_FILES {
+            let mut by_age: Vec<(u64, String)> =
+                self.cache.iter().map(|(k, e)| (used(e), k.clone())).collect();
+            by_age.sort_unstable_by(|a, b| b.0.cmp(&a.0)); // newest first
+            for (_, k) in by_age.into_iter().skip(CACHE_MAX_FILES) {
+                self.cache.remove(&k);
+            }
+        }
+
+        let doc = json!({ "version": 1, "files": self.cache });
+        let _ = write_private(
+            &self.dir.join(CACHE_FILE),
+            &serde_json::to_string(&doc).unwrap_or_default(),
+        );
+    }
+
+    /// Drop the restored node of an earlier file once it is no longer the connected one.
+    fn prune_external(&mut self) {
+        let Some(last) = self.nodes.len().checked_sub(1) else { return };
+        if self.nodes[last].external && self.active.as_ref().map(|a| a.node) != Some(last) {
+            self.nodes.pop();
+            self.rebuild();
+        }
     }
 
     fn selected_node(&self) -> Option<usize> {
@@ -1247,6 +1462,10 @@ impl App {
         let active_node = self.active.as_ref().map(|a| a.node);
         let mut v: Vec<usize> = (0..self.nodes.len())
             .filter(|&i| {
+                // The still-running connection of another file is not listed here.
+                if self.nodes[i].external {
+                    return false;
+                }
                 // The connected node is always listed, whatever the filters say.
                 if Some(i) == active_node {
                     return true;
@@ -1346,7 +1565,17 @@ impl App {
                 thread::sleep(Duration::from_millis(if vpn { 2500 } else { 1500 }));
             }
             let proxy = format!("127.0.0.1:{SOCKS_PORT}");
-            let res = probe_exit(if vpn { None } else { Some(proxy.as_str()) });
+            let mut res = probe_exit(if vpn { None } else { Some(proxy.as_str()) });
+            if wait {
+                // Right after connecting the core may still be starting: try again a few times.
+                for _ in 0..3 {
+                    if res.is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1500));
+                    res = probe_exit(if vpn { None } else { Some(proxy.as_str()) });
+                }
+            }
             let _ = tx.send(Msg::Exit(node, res));
         });
     }
@@ -1456,6 +1685,7 @@ impl App {
                 };
                 self.active = Some(Active { node: i, pid, child: Some(child), vpn });
                 self.check_exit();
+                self.prune_external();
                 self.save_state();
             }
             Err(e) => self.status = format!("failed to start {}: {e}", core.display()),
@@ -1542,6 +1772,9 @@ impl App {
                     }
                 }
                 Msg::Exit(i, res) => {
+                    if i >= self.nodes.len() {
+                        continue; // the node was dropped (see prune_external)
+                    }
                     if self.active.as_ref().map(|a| a.node) == Some(i) {
                         match res {
                             Some((ip, code, name)) => {
@@ -1612,6 +1845,7 @@ impl App {
             self.status = format!("core exited ({st}): {tail}");
             self.active = None;
             self.exit_ip.clear();
+            self.prune_external();
             self.save_state();
         }
 
@@ -1730,7 +1964,10 @@ impl App {
                 None => self.status = "not connected".into(),
             },
             KeyCode::Enter => self.connect(),
-            KeyCode::Char('x') => self.disconnect(),
+            KeyCode::Char('x') => {
+                self.disconnect();
+                self.prune_external();
+            }
             KeyCode::Char('e') => self.check_exit(),
             KeyCode::Char('i') => {
                 self.insecure = !self.insecure;
@@ -1910,9 +2147,10 @@ fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let total = app.nodes.len();
-    let ok = app.nodes.iter().filter(|n| matches!(n.ping, Ping::Ms(_))).count();
-    let dead = app.nodes.iter().filter(|n| n.ping == Ping::Fail).count();
+    // A restored connection from another file is not one of this file's nodes.
+    let total = app.nodes.iter().filter(|n| !n.external).count();
+    let ok = app.nodes.iter().filter(|n| !n.external && matches!(n.ping, Ping::Ms(_))).count();
+    let dead = app.nodes.iter().filter(|n| !n.external && n.ping == Ping::Fail).count();
     let testing = app.nodes.iter().filter(|n| n.ping == Ping::Testing).count();
     let exit_testing = app.nodes.iter().filter(|n| n.exit == ExitState::Testing).count();
     let mut spans = vec![
@@ -2061,7 +2299,8 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             Row::new(vec![
                 Cell::from(if is_active { "●" } else { " " })
                     .style(Style::default().fg(Color::Green)),
-                Cell::from(format!("{:>3}", i + 1)).style(dim()),
+                Cell::from(if n.external { "  -".to_string() } else { format!("{:>3}", i + 1) })
+                    .style(dim()),
                 Cell::from(n.country.clone()),
                 Cell::from(n.exit_country()).style(real_style),
                 Cell::from(n.proto.to_uppercase())
@@ -2096,7 +2335,12 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Min(12),    // name
     ];
 
-    let title = format!("Servers {}/{}", app.view.len(), app.nodes.len());
+    let shown = app.view.iter().filter(|&&i| !app.nodes[i].external).count();
+    let title = format!(
+        "Servers {}/{}",
+        shown,
+        app.nodes.iter().filter(|n| !n.external).count()
+    );
     let table = Table::new(rows, widths)
         .header(header)
         .block(block(&title))
@@ -2423,7 +2667,7 @@ fn draw_guide(f: &mut Frame) {
     let left = [
         Guide::Section("Servers", "the table: one column each"),
         Guide::Field("●", "The node you are connected to. It always stays in the list, whatever the filter says."),
-        Guide::Field("#", "Position in your file. It does not change when you sort or filter."),
+        Guide::Field("#", "Position in your file. It does not change when you sort or filter. A - marks the still-connected node of an earlier file."),
         Guide::Field("Country", "Country named in the node's own label (flag or 2-letter code). Providers sometimes get it wrong."),
         Guide::Field("Exit", "Country where traffic really leaves, found from the exit IP. Blank until checked with T or P. Yellow means it differs from Country."),
         Guide::Field("Type", "VMESS, VLESS, TROJAN or SS (Shadowsocks)."),
@@ -2566,8 +2810,11 @@ CONNECTION MODES (press m in the TUI to switch):
     system VPN    all traffic goes through the node (TUN device {tun})
 
 FILES:
-    State, core config and core log are kept in $XDG_CACHE_HOME/v2tui
-    (default ~/.cache/v2tui): state.json, v2tui-config.json, v2tui-core.log
+    Everything is kept in $XDG_CACHE_HOME/v2tui (default ~/.cache/v2tui):
+      state.json          settings and the running connection (shared by every file)
+      cache.json          pings, exit IPs and cursor per subscription file, by content hash
+      v2tui-config.json   config of the running core
+      v2tui-core.log      output of the core
 
 Press ? inside v2tui for the keyboard shortcuts, f for a guide to every field.",
         version = env!("CARGO_PKG_VERSION"),
@@ -2598,7 +2845,11 @@ fn main() -> io::Result<()> {
         eprintln!("no supported links (vmess/vless/trojan/ss) found in {path}");
         std::process::exit(1);
     }
-    let mut app = App::new(nodes);
+    let file_hash = content_hash(&text);
+    let file_path = fs::canonicalize(&path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.clone());
+    let mut app = App::new(nodes, file_hash, file_path);
     let mut terminal = ratatui::init();
     let res = run(&mut terminal, &mut app);
     app.probes.kill_all(); // never leave exit-check xray processes behind
