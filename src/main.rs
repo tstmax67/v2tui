@@ -42,7 +42,7 @@ const PING_WORKERS: usize = 32;
 /// Exit-IP checks start one xray process each, so far fewer run at once than TCP pings.
 const EXIT_WORKERS: usize = 16;
 /// One exit-IP lookup (connect + SOCKS5 handshake + reply) must finish within this time.
-const EXIT_HTTP_TIMEOUT_MS: u64 = 4000;
+const EXIT_HTTP_TIMEOUT_MS: u64 = 10000;
 /// Per-subscription results (pings, exit IPs, selection) for every file ever opened.
 const CACHE_FILE: &str = "cache.json";
 /// Keep at most this many subscription files in the cache (the most recently used ones) ...
