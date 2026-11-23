@@ -40,7 +40,9 @@ const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const PING_WORKERS: usize = 32;
 /// Exit-IP checks start one xray process each, so far fewer run at once than TCP pings.
-const EXIT_WORKERS: usize = 8;
+const EXIT_WORKERS: usize = 16;
+/// One exit-IP lookup (connect + SOCKS5 handshake + reply) must finish within this time.
+const EXIT_HTTP_TIMEOUT_MS: u64 = 4000;
 /// Per-subscription results (pings, exit IPs, selection) for every file ever opened.
 const CACHE_FILE: &str = "cache.json";
 /// Keep at most this many subscription files in the cache (the most recently used ones) ...
@@ -136,10 +138,12 @@ impl Node {
         .to_lowercase()
     }
 
-    /// Country of the real exit IP, e.g. "JP Japan". Blank until the exit IP is known.
+    /// What the Exit column shows: the country of the real exit IP, "unavailable" when the
+    /// exit check failed, and blank until the node has been checked.
     fn exit_country(&self) -> String {
         match &self.exit {
             ExitState::Ok { code, name, .. } if code != "??" => name.clone(),
+            ExitState::Fail => "unavailable".to_string(),
             _ => String::new(),
         }
     }
@@ -247,6 +251,9 @@ struct Active {
     child: Option<Child>,
     /// True for VPN (TUN) mode, where the core runs as root.
     vpn: bool,
+    /// Content hash of the subscription file the node comes from. Differs from the opened
+    /// file's hash for an `external` node; empty when unknown (older state.json).
+    origin: String,
 }
 
 // ───────────────────────────── link parsing ─────────────────────────────
@@ -641,11 +648,22 @@ fn spawn_pings(jobs: Vec<(usize, String, u16)>, tx: Sender<Msg>) {
     }
 }
 
+/// Give the next read only the time that is left of the overall deadline (None = none left).
+fn arm_read(s: &TcpStream, deadline: Instant) -> Option<()> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return None;
+    }
+    s.set_read_timeout(Some(left)).ok()
+}
+
 /// SOCKS5 handshake (no authentication) asking the proxy to connect to `host:port`.
 /// The name is resolved by the proxy, so DNS lookups also go through the node.
-fn socks5_connect(s: &mut TcpStream, host: &str, port: u16) -> Option<()> {
+/// The whole handshake must finish before `deadline`.
+fn socks5_connect(s: &mut TcpStream, host: &str, port: u16, deadline: Instant) -> Option<()> {
     s.write_all(&[5, 1, 0]).ok()?; // version 5, one method: none
     let mut r = [0u8; 2];
+    arm_read(s, deadline)?;
     s.read_exact(&mut r).ok()?;
     if r != [5, 0] {
         return None;
@@ -659,6 +677,7 @@ fn socks5_connect(s: &mut TcpStream, host: &str, port: u16) -> Option<()> {
     req.extend_from_slice(&port.to_be_bytes());
     s.write_all(&req).ok()?;
     let mut head = [0u8; 4];
+    arm_read(s, deadline)?;
     s.read_exact(&mut head).ok()?;
     if head[0] != 5 || head[1] != 0 {
         return None;
@@ -669,12 +688,14 @@ fn socks5_connect(s: &mut TcpStream, host: &str, port: u16) -> Option<()> {
         4 => 16,
         3 => {
             let mut l = [0u8; 1];
+            arm_read(s, deadline)?;
             s.read_exact(&mut l).ok()?;
             l[0] as usize
         }
         _ => return None,
     };
     let mut rest = vec![0u8; addr_len + 2];
+    arm_read(s, deadline)?;
     s.read_exact(&mut rest).ok()?;
     Some(())
 }
@@ -699,25 +720,25 @@ fn dechunk(mut b: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Minimal plain-HTTP GET using only the standard library: straight out, or through a SOCKS5
-/// proxy (`host:port`). Gives up after 8 seconds in total. Returns the body of a 200 reply.
+/// proxy (`host:port`). One deadline (EXIT_HTTP_TIMEOUT_MS) covers connecting, the SOCKS5
+/// handshake and reading the reply. Returns the body of a 200 reply.
 fn http_get(host: &str, path: &str, proxy: Option<&str>) -> Option<Vec<u8>> {
-    let timeout = Duration::from_secs(8);
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + Duration::from_millis(EXIT_HTTP_TIMEOUT_MS);
+    let left = || deadline.saturating_duration_since(Instant::now());
     let mut stream = match proxy {
         Some(p) => {
             let addr = p.to_socket_addrs().ok()?.next()?;
-            let mut s = TcpStream::connect_timeout(&addr, timeout).ok()?;
-            s.set_read_timeout(Some(timeout)).ok()?;
-            s.set_write_timeout(Some(timeout)).ok()?;
-            socks5_connect(&mut s, host, 80)?;
+            let mut s = TcpStream::connect_timeout(&addr, left()).ok()?;
+            s.set_write_timeout(Some(left())).ok()?;
+            socks5_connect(&mut s, host, 80, deadline)?;
             s
         }
         None => {
             let addr = (host, 80u16).to_socket_addrs().ok()?.next()?;
-            TcpStream::connect_timeout(&addr, timeout).ok()?
+            TcpStream::connect_timeout(&addr, left()).ok()?
         }
     };
-    stream.set_write_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(left())).ok()?;
     let req = format!(
         "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: v2tui\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
@@ -763,37 +784,52 @@ fn http_get(host: &str, path: &str, proxy: Option<&str>) -> Option<Vec<u8>> {
 /// Ask a web service where traffic really comes out. With `proxy` (host:port) the request
 /// goes through that SOCKS5 proxy, otherwise straight out (used in VPN mode).
 fn probe_exit(proxy: Option<&str>) -> ExitRes {
-    let fetch = |host: &str, path: &str| -> Option<Value> {
-        serde_json::from_slice(&http_get(host, path, proxy)?).ok()
-    };
-    // Names we already know are used as-is, so both country columns spell them the same way.
-    let build = |ip: String, code: String, api_name: String| -> ExitRes {
-        let code = code.to_uppercase();
-        if ip.is_empty() || code.len() != 2 {
-            return None;
-        }
-        let known = country_name(&code);
-        let name = if known != "Other" || api_name.is_empty() {
-            known.to_string()
-        } else {
-            api_name
-        };
-        Some((ip, code, name))
-    };
+    // Both services are asked at the same time and the first usable answer wins, so a slow
+    // or blocked service no longer delays the other one.
+    let (tx, rx) = mpsc::channel::<ExitRes>();
+    let lookups: [fn(Option<&str>) -> ExitRes; 2] = [lookup_ip_api, lookup_ipinfo];
+    for lookup in lookups {
+        let tx = tx.clone();
+        let proxy = proxy.map(String::from);
+        thread::spawn(move || {
+            let _ = tx.send(lookup(proxy.as_deref()));
+        });
+    }
+    drop(tx);
+    // Ends at the first Some, or when both lookups are done and failed.
+    rx.iter().flatten().next()
+}
 
-    if let Some(v) = fetch("ip-api.com", "/json/?fields=status,country,countryCode,query") {
-        if v.get("status").and_then(|x| x.as_str()) == Some("success") {
-            if let Some(r) = build(jstr(&v, "query"), jstr(&v, "countryCode"), jstr(&v, "country")) {
-                return Some(r);
-            }
-        }
+/// Names we already know are used as-is, so both country columns spell them the same way.
+fn exit_result(ip: String, code: String, api_name: String) -> ExitRes {
+    let code = code.to_uppercase();
+    if ip.is_empty() || code.len() != 2 {
+        return None;
     }
-    if let Some(v) = fetch("ipinfo.io", "/json") {
-        if let Some(r) = build(jstr(&v, "ip"), jstr(&v, "country"), String::new()) {
-            return Some(r);
-        }
+    let known = country_name(&code);
+    let name = if known != "Other" || api_name.is_empty() {
+        known.to_string()
+    } else {
+        api_name
+    };
+    Some((ip, code, name))
+}
+
+fn fetch_json(host: &str, path: &str, proxy: Option<&str>) -> Option<Value> {
+    serde_json::from_slice(&http_get(host, path, proxy)?).ok()
+}
+
+fn lookup_ip_api(proxy: Option<&str>) -> ExitRes {
+    let v = fetch_json("ip-api.com", "/json/?fields=status,country,countryCode,query", proxy)?;
+    if v.get("status").and_then(|x| x.as_str()) != Some("success") {
+        return None;
     }
-    None
+    exit_result(jstr(&v, "query"), jstr(&v, "countryCode"), jstr(&v, "country"))
+}
+
+fn lookup_ipinfo(proxy: Option<&str>) -> ExitRes {
+    let v = fetch_json("ipinfo.io", "/json", proxy)?;
+    exit_result(jstr(&v, "ip"), jstr(&v, "country"), String::new())
 }
 
 fn free_port() -> Option<u16> {
@@ -973,11 +1009,16 @@ fn ping_from_i64(p: i64) -> Ping {
 fn exit_to_json(e: &ExitState) -> Option<Value> {
     match e {
         ExitState::Ok { ip, code, name } => Some(json!({ "ip": ip, "code": code, "name": name })),
+        // A failed exit check is remembered too, so it is shown again next time.
+        ExitState::Fail => Some(json!({ "unavailable": true })),
         _ => None,
     }
 }
 
 fn exit_from_json(v: &Value) -> Option<ExitState> {
+    if v.get("unavailable").and_then(|x| x.as_bool()) == Some(true) {
+        return Some(ExitState::Fail);
+    }
     let ip = jstr(v, "ip");
     let code = jstr(v, "code");
     let name = jstr(v, "name");
@@ -1326,12 +1367,18 @@ impl App {
                 .unwrap_or_default();
             if pid != 0 && core_alive(pid) {
                 if let Some(i) = self.nodes.iter().position(|n| n.key == key) {
-                    self.active = Some(Active { node: i, pid, child: None, vpn });
+                    let origin = self.file_hash.clone();
+                    self.active = Some(Active { node: i, pid, child: None, vpn, origin });
                 } else if let Some(n) = saved_node {
                     // Not in this file (it was changed or replaced): keep the node as saved.
+                    let origin = a
+                        .get("file_hash")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
                     self.nodes.push(n);
                     let node = self.nodes.len() - 1;
-                    self.active = Some(Active { node, pid, child: None, vpn });
+                    self.active = Some(Active { node, pid, child: None, vpn, origin });
                 } else {
                     let how = if vpn { "sudo kill" } else { "kill" };
                     self.status = format!(
@@ -1382,7 +1429,10 @@ impl App {
     fn save_global(&self) {
         let active = self.active.as_ref().map(|a| {
             let n = &self.nodes[a.node];
-            json!({ "pid": a.pid, "vpn": a.vpn, "key": n.key, "node": node_to_json(n) })
+            json!({
+                "pid": a.pid, "vpn": a.vpn, "key": n.key, "file_hash": a.origin,
+                "node": node_to_json(n)
+            })
         });
         let state = json!({
             "version": 2,
@@ -1448,6 +1498,38 @@ impl App {
             &self.dir.join(CACHE_FILE),
             &serde_json::to_string(&doc).unwrap_or_default(),
         );
+    }
+
+    /// The connected node came from another subscription file (`external`): write its exit
+    /// result into that file's entry in cache.json, so it is there when that file is opened.
+    /// Nodes of the opened file are saved by save_cache() instead.
+    fn store_external_exit(&mut self, i: usize) {
+        if !self.nodes[i].external {
+            return;
+        }
+        let Some(origin) = self
+            .active
+            .as_ref()
+            .filter(|a| a.node == i)
+            .map(|a| a.origin.clone())
+        else {
+            return;
+        };
+        if origin.is_empty() || origin == self.file_hash {
+            return; // origin unknown (older state.json)
+        }
+        let Some(exit) = exit_to_json(&self.nodes[i].exit) else { return };
+        let key = self.nodes[i].key.clone();
+        let Some(entry) = self.cache.get_mut(&origin).and_then(|e| e.as_object_mut()) else {
+            return; // that file's cache entry was forgotten (old or beyond the newest files)
+        };
+        let nodes = entry.entry("nodes").or_insert_with(|| json!({}));
+        let Some(nodes) = nodes.as_object_mut() else { return };
+        let node = nodes.entry(key).or_insert_with(|| json!({}));
+        if let Some(node) = node.as_object_mut() {
+            node.insert("exit".to_string(), exit);
+            self.state_dirty = true;
+        }
     }
 
     /// Drop the restored node of an earlier file once it is no longer the connected one.
@@ -1573,15 +1655,10 @@ impl App {
             }
             let proxy = format!("127.0.0.1:{SOCKS_PORT}");
             let mut res = probe_exit(if vpn { None } else { Some(proxy.as_str()) });
-            if wait {
-                // Right after connecting the core may still be starting: try again a few times.
-                for _ in 0..3 {
-                    if res.is_some() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1500));
-                    res = probe_exit(if vpn { None } else { Some(proxy.as_str()) });
-                }
+            if wait && res.is_none() {
+                // Right after connecting the core may still be starting: try once more.
+                thread::sleep(Duration::from_millis(1000));
+                res = probe_exit(if vpn { None } else { Some(proxy.as_str()) });
             }
             let _ = tx.send(Msg::Exit(node, res));
         });
@@ -1599,6 +1676,13 @@ impl App {
             return;
         };
         let vpn = self.vpn_mode;
+        // Which subscription file the node belongs to. Reconnecting a restored node of an
+        // earlier file (mode switch) keeps that file as its origin.
+        let origin = if self.nodes[i].external {
+            self.active.as_ref().map(|a| a.origin.clone()).unwrap_or_default()
+        } else {
+            self.file_hash.clone()
+        };
         if vpn && !self.ensure_sudo() {
             self.status = "VPN not started: sudo failed or was cancelled".into();
             return;
@@ -1690,7 +1774,14 @@ impl App {
                 } else {
                     format!("started {} (pid {pid}); it keeps running after you quit", core.display())
                 };
-                self.active = Some(Active { node: i, pid, child: Some(child), vpn });
+                self.active = Some(Active { node: i, pid, child: Some(child), vpn, origin });
+
+                // No known exit IP yet (or the last check failed) -> show "checking..." in
+                // Selected node -> Exit IP until the new check answers.
+                if !matches!(self.nodes[i].exit, ExitState::Ok { .. }) {
+                    self.nodes[i].exit = ExitState::Testing;
+                }
+
                 self.check_exit();
                 self.prune_external();
                 self.save_state();
@@ -1787,16 +1878,19 @@ impl App {
                             Some((ip, code, name)) => {
                                 self.exit_ip = ip.clone();
                                 self.nodes[i].exit = ExitState::Ok { ip, code, name };
-                                dirty = true;
-                                exit_changed = true;
                             }
                             None => {
-                                self.exit_ip = "unreachable".to_string();
-                                if self.nodes[i].exit == ExitState::Testing {
-                                    self.nodes[i].exit = ExitState::Fail;
-                                }
+                                // Unavailable: remembered (cache) and shown in red, also when
+                                // an earlier check had found an address.
+                                self.exit_ip.clear();
+                                self.nodes[i].exit = ExitState::Fail;
                             }
                         }
+                        // A restored node of another file is not saved with this file's
+                        // cache, so put the result into the cache of its own file.
+                        self.store_external_exit(i);
+                        dirty = true;
+                        exit_changed = true;
                     } else if self.nodes[i].exit == ExitState::Testing {
                         // The connection changed while the check was running.
                         self.nodes[i].exit = ExitState::Unknown;
@@ -2297,8 +2391,11 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             let n = &app.nodes[i];
             let (ptxt, pstyle) = ping_cell(n.ping);
             let is_active = active_node == Some(i);
-            // Yellow when the real exit country is not the one the node's name claims.
-            let real_style = if n.exit_differs() {
+            // Red when the exit check failed ("unavailable"); yellow when the real exit
+            // country is not the one the node's name claims.
+            let real_style = if n.exit == ExitState::Fail {
+                Style::default().fg(Color::Red)
+            } else if n.exit_differs() {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -2387,7 +2484,7 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
                 ]),
                 ExitState::Fail => Line::from(vec![
                     exit_label,
-                    Span::styled("unreachable", Style::default().fg(Color::Red)),
+                    Span::styled("unavailable", Style::default().fg(Color::Red)),
                 ]),
                 ExitState::Ok { ip, name, .. } => {
                     let mut v = vec![exit_label, Span::raw(format!("{ip}  {name}"))];
@@ -2427,12 +2524,12 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
             if a.vpn {
                 right.push(kv("Mode", MODE_VPN.into()));
                 right.push(kv("Interface", TUN_NAME.into()));
-                right.push(kv("Exit IP", active_exit_text(app, a.node)));
+                right.push(active_exit_line(app, a.node));
             } else {
                 right.push(kv("Mode", MODE_PROXY_URL.into()));
                 right.push(kv("SOCKS5 URL", format!("socks5h://127.0.0.1:{SOCKS_PORT}")));
                 right.push(kv("HTTP URL", format!("http://127.0.0.1:{HTTP_PORT}")));
-                right.push(kv("Exit IP", active_exit_text(app, a.node)));
+                right.push(active_exit_line(app, a.node));
             }
         }
         None => {
@@ -2458,15 +2555,26 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Exit IP of the running connection, with its country once known.
-fn active_exit_text(app: &App, node: usize) -> String {
-    match &app.nodes[node].exit {
-        ExitState::Ok { ip, code, name } if *ip == app.exit_ip && code != "??" => {
-            format!("{ip}  ({name})")
+/// The "Exit IP" line of the Connection box: the address of the running connection with its
+/// country once known, "checking..." while a check runs, red "unavailable" if it failed.
+fn active_exit_line(app: &App, node: usize) -> Line<'static> {
+    let n = &app.nodes[node];
+    let (text, style) = if app.exit_ip == "checking..." || n.exit == ExitState::Testing {
+        ("checking...".to_string(), Style::default().fg(Color::Yellow))
+    } else {
+        match &n.exit {
+            ExitState::Ok { ip, code, name } if code != "??" => {
+                (format!("{ip}  ({name})"), Style::default())
+            }
+            ExitState::Ok { ip, .. } => (ip.clone(), Style::default()),
+            ExitState::Fail => ("unavailable".to_string(), Style::default().fg(Color::Red)),
+            _ => ("not checked - press e".to_string(), dim()),
         }
-        _ if app.exit_ip.is_empty() => "not checked - press e".to_string(),
-        _ => app.exit_ip.clone(),
-    }
+    };
+    Line::from(vec![
+        Span::styled(format!("{:<11}", "Exit IP"), dim()),
+        Span::styled(text, style),
+    ])
 }
 
 /// Errors stay in the status box until something replaces them; other messages fade.
@@ -2676,7 +2784,7 @@ fn draw_guide(f: &mut Frame) {
         Guide::Field("●", "The node you are connected to. It always stays in the list, whatever the filter says."),
         Guide::Field("#", "Position in your file. It does not change when you sort or filter. A - marks the still-connected node of an earlier file."),
         Guide::Field("Country", "Country named in the node's own label (flag or 2-letter code). Providers sometimes get it wrong."),
-        Guide::Field("Exit", "Country where traffic really leaves, found from the exit IP. Blank until checked with T or P. Yellow means it differs from Country."),
+        Guide::Field("Exit", "Country where traffic really leaves (exit IP check, T or P). Blank until checked. Yellow: differs from Country. Red: unavailable."),
         Guide::Field("Type", "VMESS, VLESS, TROJAN or SS (Shadowsocks)."),
         Guide::Field("Address", "Host name or IP of the server v2tui connects to."),
         Guide::Field("Port", "Server port."),
@@ -2693,7 +2801,7 @@ fn draw_guide(f: &mut Frame) {
         Guide::Field("Transport", "Network type / security layer, for example ws / tls."),
         Guide::Field("SNI", "Server name sent in the TLS handshake. - means none was set."),
         Guide::Field("TCP ping", "Time to open a TCP connection to the server (t or p)."),
-        Guide::Field("Exit IP", "Public IP and country seen through this node (T or P). (≠ listed) means it differs from Country."),
+        Guide::Field("Exit IP", "Public IP and country seen through this node (T or P). (≠ listed) means it differs from Country. Red: unavailable."),
         Guide::Field("Name", "The node's label from your file."),
         Guide::Section("Connection", "the box under the table, right"),
         Guide::Field("Status", "Whether a connection is running."),
@@ -2702,7 +2810,7 @@ fn draw_guide(f: &mut Frame) {
         Guide::Field("SOCKS5 URL", "Local SOCKS5 proxy for your apps (proxy mode)."),
         Guide::Field("HTTP URL", "Local HTTP proxy for your apps (proxy mode)."),
         Guide::Field("Interface", "Name of the TUN network device (VPN mode)."),
-        Guide::Field("Exit IP", "Public IP and country of the connection, as last checked (e)."),
+        Guide::Field("Exit IP", "Public IP and country of the connection, as last checked (e). Red: unavailable."),
     ];
 
     let width = 128u16.min(f.area().width);
