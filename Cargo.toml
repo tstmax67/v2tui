@@ -1,6 +1,6 @@
 [package]
 name = "v2tui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Terminal UI to browse, ping and connect to V2Ray/Xray subscription links"
 
