@@ -42,7 +42,7 @@ const PING_WORKERS: usize = 32;
 /// Exit-IP checks start one xray process each, so far fewer run at once than TCP pings.
 const EXIT_WORKERS: usize = 16;
 /// One exit-IP lookup (connect + SOCKS5 handshake + reply) must finish within this time.
-const EXIT_HTTP_TIMEOUT_MS: u64 = 10000;
+const EXIT_HTTP_TIMEOUT_MS: u64 = 4000;
 /// Per-subscription results (pings, exit IPs, selection) for every file ever opened.
 const CACHE_FILE: &str = "cache.json";
 /// Keep at most this many subscription files in the cache (the most recently used ones) ...
@@ -1263,6 +1263,11 @@ struct App {
     file_path: String,
     /// cache.json: what is known about every subscription file seen so far, by hash.
     cache: serde_json::Map<String, Value>,
+    /// Exit result of the running connection as saved in state.json. Used at startup when
+    /// the connected node is also in the opened file but that file's cache has no exit for it.
+    restored_exit: Option<ExitState>,
+    /// Same for the TCP ping of the running connection's node.
+    restored_ping: Option<Ping>,
 }
 
 impl App {
@@ -1304,9 +1309,21 @@ impl App {
             file_hash,
             file_path,
             cache,
+            restored_exit: None,
+            restored_ping: None,
         };
         let legacy = app.load_global();
         let saved = app.load_file_cache(legacy);
+        // The running connection's exit result and ping (state.json) are the latest ones: they
+        // also fill in a node that this file shares with the file the connection was started from.
+        if let Some(a) = app.active.as_ref() {
+            if let Some(x) = app.restored_exit.take() {
+                app.nodes[a.node].exit = x;
+            }
+            if let Some(p) = app.restored_ping.take() {
+                app.nodes[a.node].ping = p;
+            }
+        }
         app.rebuild();
 
         // Jump to the running connection's row, else to where you were last time in this file.
@@ -1367,6 +1384,14 @@ impl App {
                 .unwrap_or_default();
             if pid != 0 && core_alive(pid) {
                 if let Some(i) = self.nodes.iter().position(|n| n.key == key) {
+                    self.restored_exit = saved_node
+                        .as_ref()
+                        .map(|n| n.exit.clone())
+                        .filter(|e| matches!(e, ExitState::Ok { .. } | ExitState::Fail));
+                    self.restored_ping = saved_node
+                        .as_ref()
+                        .map(|n| n.ping)
+                        .filter(|p| matches!(p, Ping::Ms(_) | Ping::Fail));
                     let origin = self.file_hash.clone();
                     self.active = Some(Active { node: i, pid, child: None, vpn, origin });
                 } else if let Some(n) = saved_node {
